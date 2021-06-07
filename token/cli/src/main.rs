@@ -217,6 +217,70 @@ pub fn signers_of(
     }
 }
 
+fn command_create_nft(
+    config: &Config,
+    nft: Pubkey,
+    recipient: Pubkey,
+    mint_decimals: Option<u8>,
+    memo: Option<String>,
+) -> CommandResult {
+    println!("Creating nft {}", nft);
+
+    let minimum_balance_for_rent_exemption = if !config.sign_only {
+        config
+            .rpc_client
+            .get_minimum_balance_for_rent_exemption(Mint::LEN)?
+    } else {
+        0
+    };
+
+    let freeze_authority_pubkey = Some(config.owner);
+
+    let (_, decimals) = resolve_mint_info(config, &recipient, None, mint_decimals)?;
+
+    let amount: u64 = 1;
+
+    let mut instructions = vec![
+        system_instruction::create_account(
+            &config.fee_payer,
+            &nft,
+            minimum_balance_for_rent_exemption,
+            Mint::LEN as u64,
+            &spl_token::id(),
+        ),
+        initialize_mint(
+            &spl_token::id(),
+            &nft,
+            &config.owner,
+            freeze_authority_pubkey.as_ref(),
+            decimals,
+        )?,
+        mint_to_checked(
+            &spl_token::id(),
+            &nft,
+            &recipient,
+            &config.owner,
+            &config.multisigner_pubkeys,
+            amount,
+            decimals,
+        )?,
+        freeze_account(
+            &spl_token::id(),
+            &recipient,
+            &nft,
+            &config.owner,
+            &config.multisigner_pubkeys,
+        )?,
+    ];
+    if let Some(text) = memo {
+        instructions.push(spl_memo::build_memo(text.as_bytes(), &[&config.owner]));
+    }
+    Ok(Some((
+        minimum_balance_for_rent_exemption,
+        vec![instructions],
+    )))
+}
+
 fn command_create_token(
     config: &Config,
     decimals: u8,
@@ -1377,6 +1441,48 @@ fn main() {
                 ),
         )
         .arg(fee_payer_arg().global(true))
+        .subcommand(SubCommand::with_name("create-nft").about("Create a new nft")
+                .arg(
+                    Arg::with_name("token_keypair")
+                    .value_name("KEYPAIR")
+                    .validator(is_valid_signer)
+                    .takes_value(true)
+                    .index(1)
+                    .help(
+                        "Specify the token keypair. \
+                             This may be a keypair file or the ASK keyword. \
+                             [default: randomly generated keypair]"
+                    )
+                )
+                .arg(
+                    Arg::with_name("account")
+                        .long("account")
+                        .value_name("ACCOUNT")
+                        .takes_value(true)
+                        .help("Specify account to own the nft"),
+                )
+                .arg(
+                    Arg::with_name("decimals")
+                        .long("decimals")
+                        .validator(is_mint_decimals)
+                        .value_name("DECIMALS")
+                        .takes_value(true)
+                        .default_value(&default_decimals)
+                        .help("Number of base 10 digits to the right of the decimal place"),
+                )
+                .arg(
+                    Arg::with_name("memo")
+                        .long("memo")
+                        .takes_value(true)
+                        .help("Specify text that should be written as a memo when the nft is created"),
+                )
+                .offline_args()
+                .arg(mint_address_arg())
+                .arg(multisig_signer_arg())
+                .nonce_args(true)
+                .offline_args_config(&SignOnlyNeedsMintAddress{})
+                ,
+        )
         .subcommand(SubCommand::with_name("create-token").about("Create a new token")
                 .arg(
                     Arg::with_name("decimals")
@@ -2059,6 +2165,27 @@ fn main() {
     solana_logger::setup_with_default("solana=info");
 
     let _ = match (sub_command, sub_matches) {
+        ("create-nft", Some(arg_matches)) => {
+            // let decimals = value_t_or_exit!(arg_matches, "decimals", u8);
+            let memo = value_t!(arg_matches, "memo", String).ok();
+            let (signer, nft) = if arg_matches.is_present("nft_keypair") {
+                signer_of(&arg_matches, "token_keypair", &mut wallet_manager).unwrap_or_else(|e| {
+                    eprintln!("error: {}", e);
+                    exit(1);
+                })
+            } else {
+                new_throwaway_signer()
+            };
+            let nft = nft.unwrap();
+            bulk_signers.push(signer);
+
+            let account = pubkey_of_signer(arg_matches, "account", &mut wallet_manager)
+                .unwrap()
+                .unwrap();
+            let mint_decimals = value_of::<u8>(&arg_matches, MINT_DECIMALS_ARG.name);
+
+            command_create_nft(&config, nft, account, mint_decimals, memo)
+        }
         ("create-token", Some(arg_matches)) => {
             let decimals = value_t_or_exit!(arg_matches, "decimals", u8);
             let memo = value_t!(arg_matches, "memo", String).ok();
